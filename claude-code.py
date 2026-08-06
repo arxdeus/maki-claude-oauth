@@ -17,14 +17,22 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-OAUTH_TOKEN_URL = "https://claude.ai/v1/oauth/token"
+OAUTH_TOKEN_URLS = (
+    "https://claude.ai/v1/oauth/token",
+    "https://console.anthropic.com/v1/oauth/token",
+)
 OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+# Cloudflare in front of claude.ai rejects the default urllib User-Agent
+# with error 1010, so we must look like the CLI.
+USER_AGENT = "claude-cli/2.0.14 (external, cli)"
 ANTHROPIC_BETA = (
     "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14"
 )
 SYSTEM_PREFIX = "You are Claude Code, Anthropic's official CLI for Claude."
 PRIMARY_SERVICE = "Claude Code-credentials"
-EXPIRY_SKEW_MS = 60_000
+# Maki resolves auth once per process and caches it, so refresh early enough
+# that a long session does not expire mid-flight.
+EXPIRY_SKEW_MS = 30 * 60_000
 ACCOUNT_STATE = Path.home() / ".local" / "state" / "maki" / "claude-code-account"
 
 
@@ -240,7 +248,11 @@ def select_account(accounts: list[ClaudeAccount]) -> ClaudeAccount | None:
 def refresh_account_from_source(source: str) -> ClaudeCredentials | None:
     if source == "file":
         return read_credentials_file()
-    raw = read_keychain_service(source)
+    try:
+        raw = read_keychain_service(source)
+    except RuntimeError as e:
+        print(f"claude-code: {e}", file=sys.stderr)
+        return None
     if not raw:
         return None
     return parse_credentials(raw)
@@ -358,7 +370,8 @@ def parse_oauth_response(
     )
 
 
-def refresh_via_oauth(refresh_token: str) -> ClaudeCredentials | None:
+def post_oauth_token(url: str, refresh_token: str) -> tuple[str | None, str | None]:
+    """Returns (body, error). Exactly one is set."""
     body = urllib.parse.urlencode(
         {
             "grant_type": "refresh_token",
@@ -367,17 +380,42 @@ def refresh_via_oauth(refresh_token: str) -> ClaudeCredentials | None:
         }
     ).encode()
     req = urllib.request.Request(
-        OAUTH_TOKEN_URL,
+        url,
         data=body,
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+            "User-Agent": USER_AGENT,
+        },
         method="POST",
     )
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
-            raw = resp.read().decode()
-    except (urllib.error.URLError, TimeoutError, OSError):
-        return None
-    return parse_oauth_response(raw, refresh_token)
+            return resp.read().decode(), None
+    except urllib.error.HTTPError as e:
+        try:
+            detail = e.read().decode()[:200]
+        except OSError:
+            detail = ""
+        return None, f"HTTP {e.code} {detail}"
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        return None, str(e)
+
+
+def refresh_via_oauth(refresh_token: str) -> ClaudeCredentials | None:
+    errors: list[str] = []
+    for url in OAUTH_TOKEN_URLS:
+        raw, err = post_oauth_token(url, refresh_token)
+        if raw is None:
+            errors.append(f"{url}: {err}")
+            continue
+        creds = parse_oauth_response(raw, refresh_token)
+        if creds:
+            return creds
+        errors.append(f"{url}: unexpected response {raw[:200]}")
+    for line in errors:
+        print(f"claude-code: oauth refresh failed: {line}", file=sys.stderr)
+    return None
 
 
 def refresh_via_cli() -> None:
@@ -410,9 +448,14 @@ def ensure_fresh(
 
     if creds.refresh_token:
         oauth = refresh_via_oauth(creds.refresh_token)
-        if oauth and oauth.expires_at > now + EXPIRY_SKEW_MS:
+        if oauth and oauth.expires_at > now:
             account.credentials = oauth
-            write_back_credentials(account.source, oauth)
+            if not write_back_credentials(account.source, oauth):
+                print(
+                    "claude-code: warning: could not persist refreshed token to "
+                    f"{account.source}; the rotated refresh token may be lost.",
+                    file=sys.stderr,
+                )
             return oauth
 
     refresh_via_cli()
