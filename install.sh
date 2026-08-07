@@ -45,6 +45,33 @@ fi
 
 chmod +x "$DEST"
 
+# Maki discovers providers by exec'ing them, so the shebang has to resolve
+# without a shell. Termux (and other prefix-based distros) have no /usr/bin/env,
+# and maki is a static binary, so termux-exec's LD_PRELOAD shebang rewriting
+# never runs. Point the shebang straight at the interpreter in that case.
+PYTHON="$(command -v python3 || command -v python || true)"
+if [[ -z "$PYTHON" ]]; then
+  echo "error: python3 not found in PATH." >&2
+  echo "       Termux: pkg install python" >&2
+  exit 1
+fi
+
+if [[ ! -x /usr/bin/env ]]; then
+  echo "No /usr/bin/env; pinning shebang to $PYTHON"
+  tmp_shebang="$(mktemp)"
+  { printf '#!%s\n' "$PYTHON"; tail -n +2 "$DEST"; } >"$tmp_shebang"
+  cat "$tmp_shebang" >"$DEST"
+  rm -f "$tmp_shebang"
+fi
+
+# Fail loudly here rather than having maki silently skip the provider.
+if ! "$DEST" info >/dev/null 2>&1; then
+  echo "error: '$DEST info' failed; maki would skip this provider." >&2
+  echo "       Output:" >&2
+  "$DEST" info >&2 || true
+  exit 1
+fi
+
 echo "Installed: $DEST"
 echo
 echo "Next steps:"

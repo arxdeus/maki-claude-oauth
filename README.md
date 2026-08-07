@@ -52,7 +52,8 @@ This provider does **not** inject Claude Code’s request-body billing header. S
 | No Claude Code credentials found | Run `claude` and complete login |
 | Keychain locked / access denied | Unlock Keychain or grant access when prompted |
 | Token expired and refresh failed | Re-authenticate with `claude` |
-| Provider not listed | Confirm `~/.config/maki/providers/claude-code` is executable; start a new session |
+| Provider not listed | Confirm `~/.config/maki/providers/claude-code` is executable and that `~/.config/maki/providers/claude-code info` prints JSON; start a new session |
+| `unknown provider 'claude-code'` on Termux | Termux has no `/usr/bin/env`, so the shebang cannot resolve. Run `pkg install python`, then re-run `install.sh` — it pins the shebang to the real interpreter |
 
 ## Disclaimer
 
