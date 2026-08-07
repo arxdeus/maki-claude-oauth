@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -17,6 +18,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+try:
+    import fcntl
+except ImportError:  # Windows: refreshes are simply not serialised.
+    fcntl = None  # type: ignore[assignment]
+
 OAUTH_TOKEN_URLS = (
     "https://claude.ai/v1/oauth/token",
     "https://console.anthropic.com/v1/oauth/token",
@@ -30,10 +36,31 @@ ANTHROPIC_BETA = (
 )
 SYSTEM_PREFIX = "You are Claude Code, Anthropic's official CLI for Claude."
 PRIMARY_SERVICE = "Claude Code-credentials"
-# Maki resolves auth once per process and caches it, so refresh early enough
-# that a long session does not expire mid-flight.
+# Anthropic revokes the previous access token whenever the refresh token is
+# exchanged, and refresh tokens are single-use. Maki resolves auth once per
+# agent spawn and caches it for the life of the process (it never re-resolves
+# on a 401), so an eager refresh kills whatever session is already running.
+# Refresh late, and only once across concurrent processes -- see
+# acquire_refresh_lock().
 EXPIRY_SKEW_MS = 30 * 60_000
+# Only used if the token endpoint omits expires_in; it currently returns 8h.
+DEFAULT_EXPIRES_IN_S = 28_800
+# resolve() gets 30s from maki, so leave headroom for our own refresh call.
+REFRESH_LOCK_TIMEOUT_S = 20.0
 ACCOUNT_STATE = Path.home() / ".local" / "state" / "maki" / "claude-code-account"
+
+
+def log(message: str) -> None:
+    """Opt-in tracing: maki discards provider stderr, so allow a log file."""
+    path = os.environ.get("CLAUDE_CODE_PROVIDER_LOG")
+    if not path:
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as fh:
+            stamp = time.strftime("%Y-%m-%dT%H:%M:%S")
+            fh.write(f"{stamp} pid={os.getpid()} {message}\n")
+    except OSError:
+        pass
 
 
 @dataclass
@@ -42,6 +69,7 @@ class ClaudeCredentials:
     refresh_token: str
     expires_at: int
     subscription_type: str | None = None
+    refresh_expires_at: int | None = None
 
 
 @dataclass
@@ -85,11 +113,15 @@ def parse_credentials(raw: str) -> ClaudeCredentials | None:
         return None
 
     sub = data.get("subscriptionType")
+    refresh_expires = data.get("refreshTokenExpiresAt")
     return ClaudeCredentials(
         access_token=access,
         refresh_token=refresh,
         expires_at=int(expires),
         subscription_type=sub if isinstance(sub, str) else None,
+        refresh_expires_at=(
+            int(refresh_expires) if isinstance(refresh_expires, (int, float)) else None
+        ),
     )
 
 
@@ -271,6 +303,10 @@ def update_credential_blob(existing_json: str, creds: ClaudeCredentials) -> str 
     target["accessToken"] = creds.access_token
     target["refreshToken"] = creds.refresh_token
     target["expiresAt"] = creds.expires_at
+    # Claude Code reads refreshTokenExpiresAt to decide whether it must re-login;
+    # leaving it stale while rotating the token underneath breaks the CLI.
+    if creds.refresh_expires_at is not None:
+        target["refreshTokenExpiresAt"] = creds.refresh_expires_at
     return json.dumps(parsed)
 
 
@@ -294,12 +330,7 @@ def keychain_account_name(service_name: str) -> str | None:
 
 
 def write_back_credentials(source: str, creds: ClaudeCredentials) -> bool:
-    new = ClaudeCredentials(
-        access_token=creds.access_token,
-        refresh_token=creds.refresh_token,
-        expires_at=creds.expires_at,
-        subscription_type=creds.subscription_type,
-    )
+    new = creds
 
     if source == "file":
         path = credentials_file_path()
@@ -360,13 +391,19 @@ def parse_oauth_response(
     if not isinstance(access, str) or not access:
         return None
     refresh = data.get("refresh_token")
-    expires_in = data.get("expires_in", 36_000)
+    expires_in = data.get("expires_in", DEFAULT_EXPIRES_IN_S)
     if not isinstance(expires_in, (int, float)):
-        expires_in = 36_000
+        expires_in = DEFAULT_EXPIRES_IN_S
+    refresh_expires_in = data.get("refresh_token_expires_in")
     return ClaudeCredentials(
         access_token=access,
         refresh_token=refresh if isinstance(refresh, str) else current_refresh_token,
         expires_at=now + int(expires_in) * 1000,
+        refresh_expires_at=(
+            now + int(refresh_expires_in) * 1000
+            if isinstance(refresh_expires_in, (int, float))
+            else None
+        ),
     )
 
 
@@ -402,20 +439,76 @@ def post_oauth_token(url: str, refresh_token: str) -> tuple[str | None, str | No
         return None, str(e)
 
 
-def refresh_via_oauth(refresh_token: str) -> ClaudeCredentials | None:
+def refresh_via_oauth(refresh_token: str) -> tuple[ClaudeCredentials | None, bool]:
+    """Returns (credentials, refresh_token_was_rejected).
+
+    The second element distinguishes "this refresh token is already spent"
+    (someone else rotated it, so re-read the store) from a transient network
+    failure (where destroying the session would be the wrong response).
+    """
     errors: list[str] = []
+    invalid_grant = False
     for url in OAUTH_TOKEN_URLS:
         raw, err = post_oauth_token(url, refresh_token)
         if raw is None:
+            if err and "invalid_grant" in err:
+                invalid_grant = True
             errors.append(f"{url}: {err}")
             continue
         creds = parse_oauth_response(raw, refresh_token)
         if creds:
-            return creds
+            return creds, False
         errors.append(f"{url}: unexpected response {raw[:200]}")
     for line in errors:
         print(f"claude-code: oauth refresh failed: {line}", file=sys.stderr)
-    return None
+        log(f"oauth refresh failed: {line}")
+    return None, invalid_grant
+
+
+def refresh_lock_path(source: str) -> Path:
+    digest = hashlib.sha256(source.encode("utf-8")).hexdigest()[:16]
+    return ACCOUNT_STATE.parent / f"claude-code-refresh-{digest}.lock"
+
+
+def acquire_refresh_lock(source: str) -> Any:
+    """Serialise refreshes so concurrent agent spawns rotate the token once.
+
+    Without this, every simultaneous resolve() spends the same single-use
+    refresh token: one wins and revokes the access token the running session
+    is holding, the rest get invalid_grant.
+    """
+    if fcntl is None:
+        return None
+    path = refresh_lock_path(source)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handle = open(path, "a+")  # noqa: SIM115 - released in release_refresh_lock
+    except OSError:
+        return None
+    deadline = time.monotonic() + REFRESH_LOCK_TIMEOUT_S
+    while True:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return handle
+        except OSError:
+            if time.monotonic() >= deadline:
+                log("timed out waiting for the refresh lock; proceeding unlocked")
+                handle.close()
+                return None
+            time.sleep(0.2)
+
+
+def release_refresh_lock(handle: Any) -> None:
+    if handle is None:
+        return
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except (OSError, AttributeError):
+        pass
+    try:
+        handle.close()
+    except OSError:
+        pass
 
 
 def refresh_via_cli() -> None:
@@ -433,37 +526,103 @@ def refresh_via_cli() -> None:
         pass
 
 
+def token_is_fresh(creds: ClaudeCredentials, now: int) -> bool:
+    return creds.expires_at > now + EXPIRY_SKEW_MS
+
+
+def persist_refreshed(
+    account: ClaudeAccount, creds: ClaudeCredentials
+) -> ClaudeCredentials:
+    account.credentials = creds
+    if write_back_credentials(account.source, creds):
+        log(f"rotated and persisted credentials for {account.source}")
+    else:
+        print(
+            "claude-code: warning: could not persist refreshed token to "
+            f"{account.source}; the rotated refresh token may be lost.",
+            file=sys.stderr,
+        )
+        log(f"FAILED to persist rotated credentials for {account.source}")
+    return creds
+
+
+def try_oauth_refresh(
+    account: ClaudeAccount, creds: ClaudeCredentials
+) -> ClaudeCredentials | None:
+    oauth, invalid_grant = refresh_via_oauth(creds.refresh_token)
+    if oauth:
+        return persist_refreshed(account, oauth)
+    if not invalid_grant:
+        return None
+
+    # Our refresh token was already spent -- the Claude CLI or another maki
+    # process rotated it. Adopt whatever is in the store now instead of
+    # burning a `claude` invocation.
+    latest = refresh_account_from_source(account.source)
+    if not latest or latest.refresh_token == creds.refresh_token:
+        return None
+    log("refresh token was rotated externally; adopting the stored one")
+    if latest.expires_at > int(time.time() * 1000):
+        account.credentials = latest
+        return latest
+    oauth, _ = refresh_via_oauth(latest.refresh_token)
+    return persist_refreshed(account, oauth) if oauth else None
+
+
 def ensure_fresh(
     account: ClaudeAccount, *, force: bool = False
 ) -> ClaudeCredentials | None:
-    # Pick up external updates (Claude CLI / other tools).
+    # Pick up external updates (Claude CLI / other maki processes).
     on_disk = refresh_account_from_source(account.source)
     if on_disk:
         account.credentials = on_disk
 
-    creds = account.credentials
     now = int(time.time() * 1000)
-    if not force and creds.expires_at > now + EXPIRY_SKEW_MS:
-        return creds
+    if not force and token_is_fresh(account.credentials, now):
+        return account.credentials
 
-    if creds.refresh_token:
-        oauth = refresh_via_oauth(creds.refresh_token)
-        if oauth and oauth.expires_at > now:
-            account.credentials = oauth
-            if not write_back_credentials(account.source, oauth):
-                print(
-                    "claude-code: warning: could not persist refreshed token to "
-                    f"{account.source}; the rotated refresh token may be lost.",
-                    file=sys.stderr,
-                )
-            return oauth
+    started_with = account.credentials.access_token
+    lock = acquire_refresh_lock(account.source)
+    try:
+        # Re-read under the lock: a peer may have refreshed while we queued.
+        latest = refresh_account_from_source(account.source)
+        if latest:
+            account.credentials = latest
+        creds = account.credentials
+        now = int(time.time() * 1000)
 
-    refresh_via_cli()
-    refreshed = refresh_account_from_source(account.source)
-    if refreshed and refreshed.expires_at > now + EXPIRY_SKEW_MS:
-        account.credentials = refreshed
-        return refreshed
-    return None
+        # Exchanging the refresh token revokes the access token every other
+        # process is currently using, so never mint a second one when a peer
+        # already did the work.
+        if creds.access_token != started_with and creds.expires_at > now:
+            log("reusing the token a peer process just refreshed")
+            return creds
+        if not force and token_is_fresh(creds, now):
+            return creds
+
+        if creds.refresh_token:
+            refreshed = try_oauth_refresh(account, creds)
+            if refreshed and refreshed.expires_at > now:
+                return refreshed
+
+        current = account.credentials
+        now = int(time.time() * 1000)
+        if current.expires_at > now:
+            # Refresh failed (usually a network blip) but the cached token is
+            # still valid. Returning it beats spawning `claude`, which would
+            # rotate the token and revoke it out from under live sessions.
+            log("refresh failed; falling back to the still-valid cached token")
+            return current
+
+        log("token expired and oauth refresh failed; falling back to claude CLI")
+        refresh_via_cli()
+        recovered = refresh_account_from_source(account.source)
+        if recovered and recovered.expires_at > now:
+            account.credentials = recovered
+            return recovered
+        return None
+    finally:
+        release_refresh_lock(lock)
 
 
 def auth_json(creds: ClaudeCredentials) -> dict[str, Any]:
